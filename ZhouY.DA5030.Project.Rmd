@@ -1,0 +1,546 @@
+---
+title: "DA5030 – Signature Project"
+author: "Yanling Zhou"
+date: "12/6/22"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+## Code Chunk
+```{r}
+library(ipred) 
+library(RWeka)
+library(naivebayes)
+library(pROC)
+library(ROSE)
+library(tidyverse)
+library(caret)
+library(klaR)
+library(rpart)
+library(rpart.plot)
+library(OneR)
+library(gmodels)
+library(performanceEstimation)
+library(psych)
+```
+**Business understanding:** The goal of the project is to predict the severity of periodontitis based on the other independent variables (age, BMI, blood pressure, dental hygiene, etc.).
+
+**Data understanding:** The data I selected was named “Raw Data of effect of obesity on risk and severity of periodontitis” which includes variables associated with one’s demographics, health status, and oral health. The data was collected originally by Universitas Indonesia and is stored in Harvard dataverse.
+
+**Algorithm selection:**Because the target variable is a 3-level categorical data, the algorithms I selected are used for classification. Out of all classification algorithms, the **Naïve Bayes, decision tree and RIPPER algorithms** are the most appropriate. Although Naïve Bayes is not good with numeric data, the data can be binned before modeling. **Confusion matrix, accuracy, precision, recall, and AUC** will be used to evaluate classification model.
+
+## 1. Data Acquisition
+```{r}
+# data is download from the Harvard Dataverse. The URL can be used directly to import the data.
+OB_periodontitis<- read.csv("https://drive.google.com/uc?id=1B5U0dlessXAdt7StgRURQ5WW3Pnt4i7U&esport=download")
+head(OB_periodontitis)
+```
+
+## 2.Data Exploration
+**1) Data Abbreviations**
+
+- **BMI:** Body mass index
+- **CAL:** Clinical attachment loss
+- **OHI:**Oral hygiene index
+- **PD:** Pocket Depth
+- **PI:** Plaque index
+
+**2) Remove irrelevant variables**
+
+- The 33th to 45th columns of original data are categorized version of the other columns which are redundant, thus they are removed. The 16th to 18th columns are also removed as some of them are irrelevant (e.g. CI,DI, PBI) to this analysis, and the data about PD are removed and both PD and CAL are indicators of periodontitis, and CAL is kept instead.
+```{r}
+OB_Teeth<-OB_periodontitis[c(1:12,14:15,19,31:32)]
+```
+
+
+**Identification of principal components (PCA):**PCA identify the variables that explains the most variance when facing a wide data.
+```{r}
+# PCA allows us to identify the most relevant variables that explain the most variance
+OBT_PCA<-prcomp(OB_Teeth[-c(2,8:12,16:17)], center = TRUE,scale. = TRUE)
+
+# The total variance explained by each principal component: the PC1 explains 28.5% of total variance, PC2 explains 22.3%, PC3 explains 19.1%, PC4 explains 12.7%, PC5 explains 8.4%the first 5 PC explains 91% of the total variance. 
+result<-OBT_PCA$sdev^2 /sum(OBT_PCA$sdev^2)
+result
+
+
+OBT_PCA$rotation <- -1*OBT_PCA$rotation# reverse the signs as eigenvectors in R point in the negative direction by default
+OBT_PCA$rotation #PC1 has high value in number of teeth, Height, OHI.PC2  has high value in age, PI, OHI. PC3 has highest vale in age,BMI and systole.PC 4 has the highest value in BMI, weight, age. PC5 has the highest value in height,diastole,weight. 
+
+```
+
+**Therefore, the variables that explains the most variance are height, number of teeth, OHI, PI, age. However, the number of variables are small and all variables has fair share in terms of explaining the variance according to PCA. Therefore, all variables are kept.**
+
+**3) Stats of the dataset**
+
+- Exploring the five number summary of each column, the number of NAs among the dataset, and the structure of the dataset. There is no NAs in the dataset and all data are numeric or integer. 
+```{r}
+head(OB_Teeth);summary(OB_Teeth);str(OB_Teeth)
+```
+
+**4) Exploratory data plots**
+```{r}
+#Boxplot with continuous variabels to display the outliers
+OBT_BoxP<-boxplot(OB_Teeth[-c(2,8:12,16:17)],las=2)
+
+#Use pairs.panel to display the distributions of each continuous variable and the coefficient between them. 
+OBT_pairPanel<-pairs.panels(OB_Teeth[-c(2,8:12,16:17)])
+```
+
+**5) Detection of outliers for continuous features**
+```{r}
+#The 27 outliers are detected from the boxplot. I decided to keep the outliers are they may contain important information
+OBT_BoxP$out
+```
+
+**6) correlation/collinearity/chi-squared analysis**
+
+- Below is a correlation matrix that display the correlations between each variables. correlation defines the strength of linear relationship between two variables, the larger the absolute value of correlation the stronger the relationship. Thus, the correlation that is >= 07 or <= -0.7 is considered a strong correlation.a strong correlation indicates a collinearity between the two variables. 
+```{r}
+#correlation matrix to display coefficient between each variables
+Correlation<-cor(OB_Teeth);Correlation
+```
+
+- Lists of strong correlation, there are 5 strong correlations which are listed below. They are **sex & age (0.8096859),height & age(-0.7203323),sex & height(-0.7646432), weight & BMI(0.7540793), PI & OHI(0.7498143)**, and they are likely to be collinearity.
+```{r}
+Correlation[sapply(Correlation, function(x) any(x!=1& (x>=0.7|x<=-0.7)))]
+```
+
+- Verify the dependency of the 5 pairs have strong correlation using **chi-squared test**. 
+```{r}
+chisq.test(OB_Teeth$Age,OB_Teeth$Sex);chisq.test(OB_Teeth$Age,OB_Teeth$Height);chisq.test(OB_Teeth$Height,OB_Teeth$Sex);chisq.test(OB_Teeth$Weight,OB_Teeth$BMI);chisq.test(OB_Teeth$PI,OB_Teeth$OHI)
+
+```
+**- Out of 5 pairs that are tested, the dependency between height~age are not statistically significant (P value >0.05), and the other four sets are showing dependencies (p value <0.05). Therefore I will remove sex, weight, and PI in the Data Cleaning & Shaping section.**
+
+**7) Evaluation of distribution** 
+
+- According to the histograms in the pair panels in (2.4 exploratory data plots), all the continuous variables except height and age have bell curve, and they are normally distributed. The graph of NumberofTeeth seems to be skew to the right. Then I performed shapiro Wilk normality test below and combine all the p values in a data frame. 
+```{r}
+SWtestdat<-setNames(data.frame(matrix(ncol = 9, nrow = 0)), colnames(OB_Teeth[-c(2,8:12,16:17)]))
+for (i in 1:ncol(OB_Teeth[-c(2,8:12,16:17)])){
+  SWtestdat[1,i]<-shapiro.test(OB_Teeth[-c(2,8:12,16:17)][,i])$p
+ 
+}
+SWtestdat
+
+```
+**All the p values for the shapiro test are less than 0.05 which indicates all the variables are NOT normally distributed.**
+
+## 3. Data Cleaning & Shaping
+
+**1) Identification of missing values**
+```{r}
+#Identify all the NAs.
+colSums(is.na(OB_Teeth))
+```
+
+**- There is no missing value in the data frame.** 
+
+**2) Data imputation of missing data**
+
+- There is no missing value in the original data, and I will randomly insert missing value to the data and imputing them.  
+```{r}
+#creating a dataframe with missing values randomly assigned
+set.seed(1234)
+OB_NA<-as.data.frame(lapply(OB_Teeth, function(x) x[sample(c(TRUE, NA), prob = c(0.9, 0.1), size = length(x), replace = TRUE) ]))
+colSums(is.na(OB_NA))
+```
+- Impute missing **category value** with the most frequent value
+```{r}
+OB_NA_categorical<-OB_NA[-c(1,3:7,13:17)]
+for (i in 1:ncol(OB_NA_categorical)){
+ OB_NA_categorical[,i]<-ifelse(is.na(OB_NA_categorical[,i]),which.max(tabulate(match(OB_NA_categorical[,i], unique(OB_NA_categorical[,i],na.rm=T)))),OB_NA_categorical[,i])
+}#insert the most frequent value to replace missing values
+colSums(is.na(OB_NA_categorical))# all NAs in the categorical variables are imputed.
+
+```
+
+- Impute missing **continuous value** with the mean
+```{r}
+OB_NA_continuous<-OB_NA[-c(2,8:12,16:17)]
+for (h in 1:ncol(OB_NA_continuous)){
+  OB_NA_continuous[,h]<-ifelse(is.na(OB_NA_continuous[,h]), mean(OB_NA_continuous[,h],na.rm=T),OB_NA_continuous[,h])
+}#insert the mean to replace the missing value
+colSums(is.na(OB_NA_continuous)) # all NAs in the continuous variables are imputed.
+```
+
+- Combine the imputed data frames together 
+```{r}
+OB_NARM<-cbind(OB_NA_continuous,OB_NA_categorical)#new dataframe with NA imputed.
+colSums(is.na(OB_NARM)) #all NAs are imputed
+```
+
+**3) Normalization/standardization of feature values** 
+
+- As I am using naive bayes, decision tree, and RIPPER algorithm, normalization/standardization is not needed. I will perform normalization for the question purpose. 
+```{r}
+#split data into 70/30
+train.dat<-OB_Teeth[1:183,]
+test.dat<-OB_Teeth[184:262,]
+
+#create a function for min-max normalization for test data using the min and max of the train data
+normalize_test <- function(x,y) {
+    return((x - min(y)) / (max(y) - min(y)))
+}
+
+#apply the function to the continuous input features in the test set
+test_norm<-as.data.frame(mapply(normalize_test, test.dat[-c(2,8:12,16:19)],train.dat[-c(2,8:12,16:19)]))
+summary(test_norm)
+
+```
+```{r}
+#create a function for min-max normalization for train data
+normalize_train <- function(x) {
+    return((x - min(x)) / (max(x) - min(x)))
+}
+
+#apply the function to the continuous input features in the training set
+train_norm <- as.data.frame(lapply(train.dat[-c(2,8:12,16:17)], normalize_train))
+summary(train_norm)
+```
+
+```{r}
+test_norm<-cbind(test_norm,test.dat[-c(1,3:7,13:17)]) #combine the normalized continuous data with the categorical data for the test data.
+train_norm<-cbind(train_norm,train.dat[-c(1,3:7,13:17)]) #combine the normalized continuous data with the categorical data for the train data
+summary(test_norm); summary(train_norm)
+```
+
+**4) Dummy codes if required for algorithm**
+
+- Remove Multicollinearity (sex, weight, and PI) 
+```{r}
+OB_Teeth<-OB_Teeth[-c(2,4,14)]
+```
+
+- Bin the other continuous variables and coerce categorical data to factors.**I will not use one-hot encoding (dummy variable) as it is unnecessary for the algorithms of my choice(naive bayes, decision tree, and RIPPER algorithm)**
+```{r}
+OBT_categorical<-OB_Teeth%>%#Bin the continuous variables
+  mutate(AgeBins = cut(Age, breaks = c(min(Age)-1,34,52,max(Age)+1)),
+        HeightBins=cut(Height, breaks = c(min(Height)-1,1.53,1.68,max(Height)+1)), 
+         BMIBins = cut(BMI, breaks = c(min(BMI)-1,18.5,24.9,29.9,max(BMI)+1)), 
+         NumberofteethBins = cut(Numberofteeth, breaks = c(min(Numberofteeth)-1,19,23,max(Numberofteeth)+1)),
+        OHIBins = cut(OHI, breaks = c(min(OHI)-1,1.2,3.0,6.0)))
+OBT_categorical[6:10] <- lapply(OBT_categorical[6:10], factor)#coerce categorical data to factors 
+```
+
+**5) Transformation of features to adjust distribution**
+
+- Since all my variables are converted to categorical data for naive bayes, feature transformation is not needed. However, according to the Shapiro-Wilk test that was done in the (2.7 evaluation of distribution), all the variables are not normally distributed.The log, inverse, or square-root transformation can be done on each variables and use Shapiro-Wilk test to evaluate the P value, the transformation method with the the highest p value will be used.And last, Shapiro-Wilk test will be done on the transformed data to evaluate the effectiveness of the transformation. 
+
+
+**6) Feature engineering: new derived features**
+
+**Categorize column 16 to 17 into the one target variable (severity  of periodontitis) based on the following criteria **
+
+- **mild periodontitis (1)**  CAL ≥ 6 mm no more than 8 sites.
+- **Moderate periodontitis (2)** CAL ≥ 6 mm at 9-18 sites.
+- **Severe periodontitis (3)** CAL ≥ 6 mm more than 18 sites.
+```{r}
+
+OBT_categorical<-OBT_categorical%>%
+    mutate(severity = 
+           ifelse(!(CAL_morethan6mm + CAL_6mm>8),
+                  "1",
+           ifelse(!(CAL_morethan6mm+CAL_6mm<9)& !(CAL_6mm + CAL_morethan6mm >18),
+                  "2",
+           ifelse(!(CAL_6mm + CAL_morethan6mm <19),
+                 "3",
+                 "NA"))))
+OBT_categorical$severity<-as.factor(OBT_categorical$severity) #convert into factor
+summary(OBT_categorical$severity)
+prop.table(table(OBT_categorical$severity))#the target variable has 78% of mild, 12% of moderate, and 9.5% of severe.
+```
+
+**Categorize Systole and Diastole into a blood pressure variable based on the following criteria**
+
+- 1) normal (<120 systolic and <80 diastolic)(1), 
+- 2) elevated (120–129 systolic and <80 diastolic)(2) 
+- 3) stage 1 hypertension (130–139 systolic or 80–89diastolic)(3) 
+- 4) stage 2 hypertension (≥140 systolic or ≥90 diastolic)(4)
+```{r}
+OBT_categorical<-OBT_categorical%>%
+    mutate(BP = 
+           ifelse(Systole<120 & Diastole<80,
+                  "1",
+           ifelse(!(Systole>129|Systole<120) & Diastole<80,
+                  "2",
+           ifelse(!(Systole>139|Systole<130) |!(Diastole<80|Diastole>89),
+                 "3",
+           ifelse(!(Systole<140)|!(Diastole<90),
+                 "4",
+                 "NA")))))
+OBT_categorical$BP<-as.factor(OBT_categorical$BP)
+summary(OBT_categorical$BP)
+
+```
+
+
+
+## 4. Model Construction
+
+**1) Creation of training & validation subsets**
+```{r}
+#split the data into 70/30
+set.seed(1234)
+intraining<-createDataPartition(OBT_categorical$severity,p=0.7,list=F)
+train<-OBT_categorical[intraining,]
+test<-OBT_categorical[-intraining,]
+dim(train);dim(test)
+prop.table(table(test$severity)) # the test set has good representation of the data. However, the data is imbalanced as the 78% are mild, 12% are moderate, and 9.5% are severe, and I will use hybrid Sampling after evaluate the accuracy of the classification. 
+```
+**2) Creation of model A with proper data encoding-- Naive Bayes**
+```{r}
+#train the Naive Bayes model
+OBT_NBmodel <- NaiveBayes(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train)
+
+```
+
+**3) Creation of model B with proper data encoding--decision Tree**
+```{r}
+#building the decision tree model
+OBT_RTmodel <- rpart(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train, control = rpart.control(cp = 0.0001))
+
+#graph the model 
+rpart.plot(OBT_RTmodel,digits = 4, fallen.leaves = TRUE,
+               type = 3, extra = 101)
+
+```
+
+**4) Creation of model C with proper data encoding --RIPPER**
+```{r}
+#building RIPPER model
+OBT_RuleModel <- JRip(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train) 
+
+```
+
+## 5.Model Evaluation
+
+**1) Evaluation of fit of models with holdout method**
+
+- Naive Bayes
+```{r}
+#run the test data in the Naive Bayes model
+OBT_NB_class <- predict(OBT_NBmodel, test[,-20])
+
+#build a confusion matrix
+CrossTable(OBT_NB_class$class, test[,20],
+    prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+    dnn = c('predicted', 'actual'))
+
+#accuracy= 0.662
+0.623+0.013+0.026
+#Precision = 0.2
+2/(6+2+2)
+#recall=0.286
+2/(4+1+2)
+
+#AUC = 0.577 is very low, which indicates no discrimination, the prediction is likely made by guessing 
+multiclass.roc(predictor=as.numeric(OBT_NB_class$class), response=test[,20])$auc
+```
+**The accuracy of the naive Bayes model is 66.2%, the precision is 20%, the recall is 28% with AUC of 57.7%**
+
+
+- Decision tree
+```{r}
+#making the classification on the test data with decision tree model
+OBT_RT_class <- predict(OBT_RTmodel, test, type = "class")
+
+#build a confusion matrix
+CrossTable(OBT_RT_class , test[,20],
+    prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+    dnn = c('predicted', 'actual'))
+
+#accuracy= 0.805
+0.792+0.013
+#Precision = 1
+1/1
+#recall=0.143
+1/(6+1)
+
+#AUC = 0.546 is also very low, which indicates no discrimination, the prediction is likely made by guessing 
+multiclass.roc(predictor=as.numeric(OBT_RT_class), response=test[,20])$auc
+```
+**The accuracy of the decision tree model is 80.5%, the precision is 100%, the recall is 14.3% with AUC of 54.8%**
+
+- RIPPER
+```{r}
+#making the classification on the test data with RIPPER
+OBT_Rule_class<-predict(OBT_RuleModel, test)
+
+#build a confusion matrix
+CrossTable(OBT_Rule_class, test[,20],
+    prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+    dnn = c('predicted', 'actual'))
+
+#accuracy= 0.753
+#Precision = NA (there is TP)
+#recall=NA (there is no TP)
+
+#the AUC = 0.484 is very low, which indicates no discrimination, the prediction is likely made by guessing 
+multiclass.roc(predictor=as.numeric(OBT_Rule_class), response=test[,20])$auc
+```
+**The accuracy of the decision tree model is 79.2% with AUC of 48.4%, with no the precision and recall as no positive case (severe 3) is predicted.**
+
+**2) Hybrid Sampling the imbalanced data**
+
+- a. Due to the data imbalance, the AUC of all three model are very low. Therefore, I hybrid sampled the data with SMOTE.
+```{r}
+# Since severity is multi-class categorical data, I will use SMOTE twice to balance all three classes. 
+set.seed(234)
+balancedsample<-performanceEstimation::smote(severity ~ ., OBT_categorical, perc.over =7.5,perc.under=1.8, k =10)
+balancedsample<-performanceEstimation::smote(severity ~ ., balancedsample, perc.over =4.0,perc.under=2.3, k =10)
+table(balancedsample$severity);prop.table(table(balancedsample$severity)) # the new sample is much more balanced. 
+
+
+#split the data into 70/30
+set.seed(1234)
+intraining2<-createDataPartition(balancedsample$severity,p=0.7,list=F)
+train_balanced<-balancedsample[intraining2,]
+test_balanced<-balancedsample[-intraining2,]
+dim(train_balanced);dim(test_balanced)
+prop.table(table(test_balanced$severity)) # the test set has good representation of the balanced data.
+```
+
+- b. Naive Bayes model with the balanced data
+```{r}
+OBT_NBmodel_balanced <- NaiveBayes(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train_balanced)
+
+#run the test data in the Naive Bayes model, accuracy=69.2%, precision=70%, recall=75%
+OBT_NB_class_balanced <- predict(OBT_NBmodel_balanced, test_balanced)
+confusionMatrix(OBT_NB_class_balanced$class,reference=test_balanced[,20])
+
+#AUC = 0.803, which is a huge improvement from 0.577. 
+multiclass.roc(predictor=as.numeric(OBT_NB_class_balanced$class), response=test_balanced[,20])$auc
+```
+
+- c. Decision Tree model with the balanced data
+```{r}
+#building the decision tree model
+OBT_RTmodel_balanced <- rpart(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train_balanced, control = rpart.control(cp = 0))
+
+#run the test data in the decision tree model, accuracy= 64.3%, precision=73.9%, recall=65.4%
+OBT_RT_class_balanced <- predict(OBT_RTmodel_balanced, test_balanced, type = "class")
+confusionMatrix(OBT_RT_class_balanced,reference=test_balanced[,20])
+
+#AUC = 0.781, which is also a huge improvement from 0.546. 
+multiclass.roc(predictor=as.numeric(OBT_RT_class_balanced), response=test_balanced[,20])$auc
+```
+
+- d. RIPPER model with the balanced data
+```{r}
+#building the RIPPER model
+OBT_Rmodel_balanced <- JRip(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train_balanced)#55.1% accuracy predicting the training data
+
+#run the test data in the RIPPER model, accuracy =53.3%, precision=67.6%, recall=48.08%
+OBT_R_class_balanced <- predict(OBT_Rmodel_balanced, test_balanced);confusionMatrix(OBT_R_class_balanced,reference=test_balanced[,20])
+
+#AUC = 0.672, although not as good as the other two models, it is still a improvement from 0.48. 
+multiclass.roc(predictor=as.numeric(OBT_R_class_balanced), response=test_balanced[,20])$auc
+```
+
+**The AUC of all three model are significantly improved after hybrid sampling the data, although the accuracy have decreased but the precision and recall are increased. which mean more positive cases are correctly identified which is the goal of the project**
+
+**3) Evaluation with k-fold cross-validation** K-fold cross validation provides better evaluation of the model and reduce overfitting.
+```{r}
+set.seed(1234)
+#build a cross-validation method with k=10
+ctrl <- trainControl(method = "cv", number = 10)
+
+```
+
+- Naive Bayes
+```{r}
+OBT_Kfold<-balancedsample[-c(1:5,11:14)]#remove the unused variables
+#accuracy=59%
+K_NBmodel <- train(severity~., data=OBT_Kfold, trControl = ctrl,'naive_bayes'); confusionMatrix(K_NBmodel)
+```
+
+- Decision tree
+```{r}
+#accuracy=55%
+K_RTmodel <- train(severity~., data=OBT_Kfold, trControl = ctrl,'rpart'); confusionMatrix(K_RTmodel)
+```
+
+- RIPPER 
+```{r}
+#accuracy=70.66%
+K_Rmodel <- train(severity~., data=OBT_Kfold, trControl = ctrl,'JRip'); confusionMatrix(K_Rmodel)
+```
+
+**The accuracy of Naive Bayes with balanced data is 59%, accuracy of decision tree is 55%  and accuracy of RIPPER with the balanced data is 70.66% via 10 fold cross validation. The RIPPER has the best performance based on k-fold, it's likely the model was overfit**
+
+**4) Tuning of model hyperparameters as available**
+
+- Hyperparameter tuning is select sets of optimal hyperparameters for a ML algorithm such as k in KNN, kernel type for SVM, and hidden layers and nodes for ANN. However, those are not applicable to the algorithms I used. 
+
+**5) Comparison of models and interpretation**
+
+- As mentioned earlier, when using the hold-out method with imbalanced data or hold-out method with balanced data, the Naive Bayes has the highest AUC out of all three models, followed by decision tree, then RIPPER. Although, the accuracy of the imbalanced data cannot objectively reflect the quality of the model due to the data imbalance, the significant improvement in AUC (which is more comprehensive measure) pre and post hybrid sampling has shown that the Naive Bayes has the best prediction among all three. 
+
+
+## Model Tuning & Performance Improvement
+
+**1) Use of bagging with homogeneous learners**
+```{r}
+set.seed(1234)
+#fit the bagged model
+bag <- bagging(formula = severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train_balanced,nbagg = 150,coob = TRUE)
+bag # with out of bag RMSE of 0.229 which indicates the bagged model is a good fit to the training data. 
+
+#Making prediction on the test data
+RT_bag_class<-predict(bag, test_balanced[,-20]);confusionMatrix(RT_bag_class, reference = test_balanced[,20])
+multiclass.roc(predictor=as.numeric(RT_bag_class), response=test_balanced[,20])$auc
+
+```
+
+**The AUC of bagged decision tree is 0.827 which is improved from 0.781. the accuracy is 77.5 % is also significantly improved from the accuracies of the using single model **
+
+**2) Construction of ensemble model as a function (ensemble all four models extract the result with the majority vote)**
+```{r}
+PeriodontitiSeverity<-function(traindata,testdata){
+#Naive Bayes model
+NB_prediction <-predict(NaiveBayes(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=traindata), testdata)
+NB_class<-data.frame(NB_prediction$class)
+
+#Decision Tree model
+RT_class<- predict(rpart(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train_balanced, control = rpart.control(cp = 0)), test_balanced, type = "class")
+
+#RIPPER model
+RIPPER_class<- predict(JRip(severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=traindata),testdata)
+
+#bagging model
+Bag_class<-predict(bagging(formula = severity~Education+Occupation+Smokingstatus+Alcoholstatus+DMstatus+BP+AgeBins+HeightBins+BMIBins+NumberofteethBins+OHIBins, data=train_balanced,nbagg = 150,coob = TRUE),testdata)
+
+#combine three prediction into a dataframe
+ensembleprediction<-cbind(NB_class,RT_class,RIPPER_class,Bag_class)
+
+#select the most repeated value from each row
+result<-as.vector(as.numeric(apply(ensembleprediction,1,function(x) names(which.max(table(x))))))
+ return(result)
+}
+
+```
+
+**3) Application of ensemble to make a prediction**
+```{r}
+ensembleModel_class<-PeriodontitiSeverity(train_balanced,test_balanced)
+#accuracy=73.6%, precision=80.5%,recall=63.5%
+CrossTable(ensembleModel_class, test_balanced[,20],
+    prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+    dnn = c('predicted', 'actual'))
+
+#AUC=80.4%
+multiclass.roc(predictor=as.numeric(ensembleModel_class), response=test_balanced[,20])$auc
+```
+**The ensembled model has accuracy of 78.9%, precision of 70.6%,recall of 69.2%, and AUC of77.1%, which is a pretty decent result compare to the original models**
+
+**4. Comparison of ensemble to individual models**
+```{r}
+#create a table to compare all four models
+compare_tab <- matrix(c(0.692,0.7,0.75,0.803,0.643,0.74,0.66,0.781,0.599,0.676,0.494,0.672,0.774,0.86,0.692,0.827,0.736,0.805,0.635,0.804), ncol=4, byrow=TRUE)
+colnames(compare_tab) <- c('Accuracy', 'Precision', 'Recall', 'AUC')
+rownames(compare_tab) <- c('Naive', 'Tree','RIPPER','Bagging','Ensemble')
+compare_tab
+```
+**Comparing all five models, the Bagging model has the overall best performance. The ensemble and Naive Bayes also have very good performance. The bagging model has the highest precision and AUC, the Naive Bayes has the highest recall. All three models performed well in all four categories. The decision tree also has decent AUC and precision and the RIPPER has the poorest performance regardless of using OneR or JRip package. In conclusion, Since our goal is to classify the severity of the periodontitis and identify the one with the severe periodontitis, the bagging model is the best choice as it has the second highest recall, and the highest AUC which is a more comprehensive measurement of accuracy of the model.**
